@@ -70,7 +70,7 @@ jobs:
         run: |
           tok=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
           p=$(cut -d. -f2 <<<"$tok" | tr '_-' '/+'); while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
-          base64 -d <<<"$p" | jq '{sub, aud, ref, repository, job_workflow_ref}'
+          echo "::notice title=OIDC claims::$(base64 -d <<<"$p" | jq -c '{sub, aud}')"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
