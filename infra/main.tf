@@ -29,6 +29,13 @@ variable "github_repo" {
   default = "amir-haskel/hello-world"
 }
 
+# GitHub's OIDC "sub" claim now includes the owner and repo IDs:
+#   repo:amir-haskel@214133203/hello-world@1468879166:ref:refs/heads/main
+# IDs never change, so a deleted-and-recreated repo with the same name can't assume our role.
+variable "github_repo_with_ids" {
+  default = "amir-haskel@214133203/hello-world@1468879166"
+}
+
 variable "prefix" {
   description = "Shared account: every resource name starts with this"
   default     = "amir"
@@ -104,8 +111,8 @@ resource "aws_iam_role" "github" {
       Condition = {
         StringEquals = { "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" }
         StringLike = { "token.actions.githubusercontent.com:sub" = [
-          "repo:${var.github_repo}:ref:refs/heads/main",
-          "repo:${var.github_repo}:environment:production",
+          "repo:${var.github_repo_with_ids}:ref:refs/heads/main",
+          "repo:${var.github_repo_with_ids}:environment:production",
         ] }
       }
     }]
