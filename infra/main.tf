@@ -131,6 +131,8 @@ resource "aws_iam_role_policy" "github" {
       },
       { Effect = "Allow", Action = ["ecs:RegisterTaskDefinition", "ecs:DescribeTaskDefinition"], Resource = "*" },
       { Effect = "Allow", Action = ["ecs:UpdateService", "ecs:DescribeServices"], Resource = aws_ecs_service.app.id },
+      # The pipeline looks up the ALB address itself (describe calls don't support resource scoping).
+      { Effect = "Allow", Action = "elasticloadbalancing:DescribeLoadBalancers", Resource = "*" },
       {
         Effect    = "Allow"
         Action    = "iam:PassRole"
@@ -297,6 +299,7 @@ output "AWS_ROLE_ARN" {
   value = aws_iam_role.github.arn
 }
 
+# Just for you to open in a browser; the pipeline finds it on its own.
 output "SERVICE_URL" {
   value = "http://${aws_lb.app.dns_name}"
 }

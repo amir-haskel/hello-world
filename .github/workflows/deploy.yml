@@ -27,13 +27,14 @@ env:
   ECR_REPOSITORY: amir-hello-world
   ECS_CLUSTER: amir-hello
   ECS_SERVICE: hello-world
+  ALB_NAME: amir-hello-alb
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: ${{ vars.SERVICE_URL }}
+      url: ${{ steps.url.outputs.url }}
     # Deploys and rollbacks never overlap.
     concurrency:
       group: deploy-production
@@ -47,6 +48,13 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      # Not a hard-coded variable: ask AWS for the load balancer's current address.
+      - name: Find the service URL
+        id: url
+        run: |
+          dns=$(aws elbv2 describe-load-balancers --names "$ALB_NAME" --query 'LoadBalancers[0].DNSName' --output text)
+          echo "url=http://$dns" >> "$GITHUB_OUTPUT"
 
       - name: Resolve version to deploy
         id: target
@@ -99,7 +107,7 @@ jobs:
       - name: Verify the live version
         env:
           VERSION: ${{ steps.target.outputs.version }}
-          SERVICE_URL: ${{ vars.SERVICE_URL }}
+          SERVICE_URL: ${{ steps.url.outputs.url }}
         run: |
           live=""
           for _ in $(seq 1 24); do
