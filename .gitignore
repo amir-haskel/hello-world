@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 td.json
 td-bootstrap.json
+.terraform/
+*.tfstate
+*.tfstate.*
