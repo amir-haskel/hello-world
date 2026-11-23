@@ -18,7 +18,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def hello():
-    return jsonify(message="Hello, World!", version=VERSION)
+    return jsonify(message="Hello, Worlds!", version=VERSION)
 
 
 @app.get("/version")
