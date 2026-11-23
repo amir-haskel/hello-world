@@ -13,7 +13,7 @@ def client():
 def test_hello(client):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert resp.get_json()["message"] == "Hello, World!"
+    assert resp.get_json()["message"] == "Hello, Worlds!"
 
 
 def test_health(client):
