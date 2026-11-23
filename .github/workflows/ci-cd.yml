@@ -1,0 +1,139 @@
+name: ci-cd
+
+# PR      -> test only (nothing reaches AWS)
+# main    -> test -> version + build + smoke test + push to ECR + git tag -> deploy to ECS
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Releases on main run one at a time so two pushes can't race for the same version.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: amir-hello-world
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests
+        run: pytest -q
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+  release:
+    # A failed test job stops the release here.
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the vX.Y.Z git tag
+      id-token: write   # OIDC -> AWS, no stored keys
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need history + tags to compute the version
+
+      - name: Compute next SemVer
+        id: version
+        run: |
+          v=$(bash scripts/next_version.sh)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "### Release v$v" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Image reference
+        id: img
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          echo "ref=$REGISTRY/$ECR_REPOSITORY:$VERSION" >> "$GITHUB_OUTPUT"
+          # Tags are immutable: if this version is already in ECR (re-run), don't rebuild it.
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.img.outputs.exists == 'false'
+
+      - name: Build image
+        if: steps.img.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.img.outputs.ref }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image (must report its own version)
+        if: steps.img.outputs.exists == 'false'
+        env:
+          IMAGE: ${{ steps.img.outputs.ref }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker run -d --name smoke -p 8080:8080 "$IMAGE"
+          for _ in $(seq 1 20); do curl -fsS localhost:8080/health >/dev/null && break; sleep 1; done
+          got=$(curl -fsS localhost:8080/version | jq -r .version)
+          label=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$IMAGE")
+          echo "endpoint=$got label=$label expected=$VERSION"
+          if [ "$got" != "$VERSION" ] || [ "$label" != "$VERSION" ]; then docker logs smoke; exit 1; fi
+
+      - name: Push image to ECR
+        if: steps.img.outputs.exists == 'false'
+        run: docker push "${{ steps.img.outputs.ref }}"
+
+      - name: Tag the release in git
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+          fi
+
+  deploy:
+    needs: release
+    uses: ./.github/workflows/deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      version: ${{ needs.release.outputs.version }}

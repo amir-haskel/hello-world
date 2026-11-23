@@ -1,0 +1,111 @@
+name: deploy / rollback
+
+# Called by ci-cd after every release.
+# Also runnable by hand (Actions tab -> "deploy / rollback" -> Run workflow):
+#   - version empty  -> roll back to the release before the one that's live
+#   - version 1.2.3  -> deploy exactly that image (must already be in ECR)
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy (empty = previous version)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: amir-hello-world
+  ECS_CLUSTER: amir-hello
+  ECS_SERVICE: hello-world
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.SERVICE_URL }}
+    # Deploys and rollbacks never overlap.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve version to deploy
+        id: target
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          v="${INPUT_VERSION#v}"
+          if [ -z "$v" ]; then
+            td=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+            img=$(aws ecs describe-task-definition --task-definition "$td" --query 'taskDefinition.containerDefinitions[0].image' --output text)
+            live="${img##*:}"
+            v=$(git tag --list 'v*' --sort=-v:refname | sed 's/^v//' | awk -v live="$live" 'found {print; exit} $0 == live {found=1}')
+            [ -n "$v" ] || { echo "::error::No release older than live version $live"; exit 1; }
+            echo "Rolling back: $live -> $v"
+          fi
+          echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Not a SemVer: $v"; exit 1; }
+          aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$v" >/dev/null \
+            || { echo "::error::Image $ECR_REPOSITORY:$v not found in ECR"; exit 1; }
+          repo=$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" --query 'repositories[0].repositoryUri' --output text)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "image=$repo:$v" >> "$GITHUB_OUTPUT"
+
+      - name: Register task definition with the new image
+        id: taskdef
+        env:
+          IMAGE: ${{ steps.target.outputs.image }}
+        run: |
+          jq --arg img "$IMAGE" '.containerDefinitions[0].image = $img' ecs/task-definition.json > td.json
+          arn=$(aws ecs register-task-definition --cli-input-json file://td.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered $arn"
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+
+      - name: Roll out to ECS (rolling, zero-downtime)
+        env:
+          TD_ARN: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          desired=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].desiredCount' --output text)
+          [ "$desired" -ge 1 ] || desired=1
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$TD_ARN" --desired-count "$desired" >/dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          # If the circuit breaker rolled back, the service is "stable" on the OLD revision -> fail loudly.
+          read -r primary_td state <<<"$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query "services[0].deployments[?status=='PRIMARY'] | [0].[taskDefinition, rolloutState]" --output text)"
+          echo "primary=$primary_td rolloutState=$state"
+          if [ "$primary_td" != "$TD_ARN" ] || [ "$state" != "COMPLETED" ]; then
+            echo "::error::Deployment did not complete (circuit breaker rolled back?)"; exit 1
+          fi
+
+      - name: Verify the live version
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          SERVICE_URL: ${{ vars.SERVICE_URL }}
+        run: |
+          live=""
+          for _ in $(seq 1 24); do
+            live=$(curl -fsS "$SERVICE_URL/version" | jq -r .version || true)
+            [ "$live" = "$VERSION" ] && break
+            sleep 5
+          done
+          echo "### Live: v$live at $SERVICE_URL" >> "$GITHUB_STEP_SUMMARY"
+          [ "$live" = "$VERSION" ] || { echo "::error::Expected $VERSION, live is '$live'"; exit 1; }
